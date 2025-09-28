@@ -1,0 +1,1 @@
+bash scripts/autoregressive/extract_codes_c2i.sh --vq-ckpt /mnt/disk0/liuxh/models/vq_ds16_c2i.pt --data-path /mnt/disk2/hanhan3344/datasets/imagenet_2012/ILSVRC/Data/CLS-LOC/train --code-path /mnt/disk0/liuxh/LlamaGen/imagenet_code_c2i_flip_ten_crop --ten-crop 

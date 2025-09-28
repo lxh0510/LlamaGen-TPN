@@ -1,0 +1,23 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug Torchrun (train.py)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "args": [
+                "--nnodes", "1",
+                "--nproc_per_node", "1",
+                "--node_rank", "0",
+                "--master-port", "12352",
+                "autoregressive/sample/sample_c2i_tpn_v2.py",
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,            // 如果要调库里的代码，设为 false
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"   // 限制使用的显卡
+            }
+        }
+    ]
+}

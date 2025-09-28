@@ -362,6 +362,8 @@ class Transformer(nn.Module):
         # transformer blocks
         for layer in self.layers:
             h = layer(h, freqs_cis, input_pos, mask)
+
+        hidden_states = h
         
         # output layers
         h = self.norm(h)
@@ -379,7 +381,7 @@ class Transformer(nn.Module):
         elif targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
-        return logits, loss
+        return logits, loss, hidden_states
 
 
     def get_fsdp_wrap_module_list(self) -> List[nn.Module]:

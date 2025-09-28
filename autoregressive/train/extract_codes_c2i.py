@@ -10,7 +10,10 @@ from torchvision import transforms
 import numpy as np
 import argparse
 import os
-
+import sys
+import setproctitle
+setproctitle.setproctitle("liuxh")
+sys.path.append(os.path.abspath("/mnt/disk0/liuxh/LlamaGen"))
 from utils.distributed import init_distributed_mode
 from dataset.augmentation import center_crop_arr
 from dataset.build import build_dataset

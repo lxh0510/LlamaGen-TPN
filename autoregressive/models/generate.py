@@ -76,7 +76,7 @@ def logits_to_probs(logits, temperature: float = 1.0, top_p: float=1.0, top_k: i
 
 def prefill(model, cond_idx: torch.Tensor, input_pos: torch.Tensor, cfg_scale: float, **sampling_kwargs):
     if cfg_scale > 1.0:
-        logits, _ = model(None, cond_idx, input_pos)
+        logits, _, _ = model(None, cond_idx, input_pos)
         logits_combined = logits
         cond_logits, uncond_logits = torch.split(logits_combined, len(logits_combined) // 2, dim=0)
         logits = uncond_logits + (cond_logits - uncond_logits) * cfg_scale
@@ -90,16 +90,19 @@ def decode_one_token(model, x: torch.Tensor, input_pos: torch.Tensor, cfg_scale:
     assert input_pos.shape[-1] == 1
     if cfg_scale > 1.0:
         x_combined = torch.cat([x, x])
-        logits, _ = model(x_combined, cond_idx=None, input_pos=input_pos)
+        logits, _ , hidden_states = model(x_combined, cond_idx=None, input_pos=input_pos)
         logits_combined = logits
         cond_logits, uncond_logits = torch.split(logits_combined, len(logits_combined) // 2, dim=0) 
+        hidden_states_combined = hidden_states
+        cond_hidden_states, uncond_hidden_states = torch.split(hidden_states_combined, len(hidden_states_combined) // 2, dim=0) 
         if cfg_flag:
             logits = uncond_logits + (cond_logits - uncond_logits) * cfg_scale
+            hidden_states = uncond_hidden_states + (cond_hidden_states - uncond_hidden_states) * cfg_scale
         else:
             logits = cond_logits
     else:
-        logits, _ = model(x, cond_idx=None, input_pos=input_pos)
-    return sample(logits, **sampling_kwargs)
+        logits, _ , hidden_states = model(x, cond_idx=None, input_pos=input_pos)
+    return sample(logits, **sampling_kwargs)[0], sample(logits, **sampling_kwargs)[1], hidden_states
 
 
 def decode_n_tokens(
@@ -112,7 +115,7 @@ def decode_n_tokens(
         with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True): # Actually better for Inductor to codegen attention here
             if cfg_interval > -1 and i > cfg_interval:
                 cfg_flag = False
-            next_token, next_prob = decode_one_token(
+            next_token, next_prob, hidden_states = decode_one_token(
                 model, cur_token, input_pos, cfg_scale, cfg_flag, **sampling_kwargs
             )
             input_pos += 1
@@ -122,9 +125,96 @@ def decode_n_tokens(
     
     return new_tokens, new_probs
 
+def find_addition_tokens(tpn_model, hidden_states, generated_labels, embedding_layer, prior_embeddings, sample_entropy = True, sample_logits = True):
+    hidden_states = torch.cat(hidden_states, dim=0).to(tpn_model.device).permute(1, 0, 2)
+    generated_labels = torch.cat(generated_labels, dim=1).to(hidden_states.device)
+    generated_embeddings = embedding_layer(generated_labels)
+    ungenerated_embeddings  = prior_embeddings[:,generated_labels.shape[1]:,:]
+    #embeddings = torch.cat([generated_embeddings, ungenerated_embeddings], dim=1)
+    labels = torch.zeros((generated_embeddings.shape[0], prior_embeddings.shape[1])).to(hidden_states.device)
+    labels[:,:generated_labels.shape[1]] = generated_labels
+    labels[:,generated_labels.shape[1]:] = embedding_layer.weight.shape[0]
+    logits = tpn_model(generated_embeddings, ungenerated_embeddings, hidden_states, labels)
+    seq_len = logits.shape[1]
+    logits = torch.softmax(logits, dim=-1)
+
+    # 计算熵不如计算置信度
+    #entropy = -(logits * torch.log(logits + 1e-6)).sum(dim=2)
+    #entropy[:,:generated_labels.shape[1]] = -1e9
+    #entropy = torch.softmax(entropy, dim=-1)
+
+    # 使用置信度作为衡量标准
+    max_probs, _ = logits.max(dim=-1)
+    max_probs[:, : generated_labels.shape[1]] = -1e9
+
+
+    if sample_entropy:
+        weights = torch.clamp_min(max_probs, 0)
+        idx = torch.multinomial(weights, num_samples=1)
+    else:
+        _, idx = torch.topk(max_probs, k=1, dim=-1)
+    
+    selected_logits = torch.gather(logits, 1, idx.unsqueeze(-1).expand(-1, -1, logits.size(-1))).squeeze(1)
+    if sample_logits:
+        token_idx = torch.multinomial(selected_logits, num_samples=1)
+    else:
+        _, token_idx = torch.topk(selected_logits, k=1, dim=-1)
+
+    return idx, token_idx
+
+
+def decode_n_tokens_tpn(
+    model, tpn_model, prior_probs, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, 
+    cfg_scale: float, cfg_interval: int, start_token: int,
+    **sampling_kwargs):
+    bs = cur_token.shape[0]
+    seq_len = prior_probs.shape[1]
+    vocab_size = prior_probs.shape[2]
+    new_tokens, new_probs = [], []
+    all_tokens = torch.ones(bs, seq_len) * vocab_size
+    all_tokens = all_tokens.long().to(cur_token.device)
+    cfg_flag = True
+    embedding_layer = model.tok_embeddings
+    all_token_embeddings = embedding_layer.weight
+    prior_embeddings = torch.matmul(prior_probs, all_token_embeddings)
+    all_hidden_states = []
+    for i in range(num_new_tokens):
+        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True): # Actually better for Inductor to codegen attention here
+            if cfg_interval > -1 and i > cfg_interval:
+                cfg_flag = False
+            next_token, next_prob, hidden_states = decode_one_token(
+                model, cur_token, input_pos, cfg_scale, cfg_flag, **sampling_kwargs
+            )
+
+            # to do: 验证步
+            all_hidden_states.append(hidden_states)
+
+            input_pos += 1
+            new_tokens.append(next_token.clone())
+            all_tokens[:,i] = next_token.squeeze(-1).clone()
+            new_probs.append(next_prob.clone())
+
+            if input_pos >= start_token: 
+
+                addition_token_loc, addition_token_idx = find_addition_tokens(tpn_model, all_hidden_states, new_tokens, embedding_layer, prior_embeddings)
+
+                # 这么写有问题
+                #all_tokens[:,addition_token_loc.squeeze(0)] = addition_token_idx
+                rows = torch.arange(bs, device=all_tokens.device)
+                cols = addition_token_loc.squeeze(1)
+                all_tokens[rows, cols] = addition_token_idx.squeeze(1)
+                finished = torch.all(all_tokens != vocab_size)
+
+                if finished:
+                    print("llm 生成的token : " , input_pos)
+                    return  all_tokens.tolist(), new_probs
+              
+            cur_token = next_token.view(-1, 1)
+    
+    return new_tokens, new_probs
 
 @torch.no_grad()
-def generate(model, cond, max_new_tokens, emb_masks=None, cfg_scale=1.0, cfg_interval=-1, **sampling_kwargs):
+def generate(model, tpn_model, prior_probs,  cond, max_new_tokens, emb_masks=None, cfg_scale=1.0, cfg_interval=-1, **sampling_kwargs):
     if model.model_type == 'c2i':
         if cfg_scale > 1.0:
             cond_null = torch.ones_like(cond) * model.num_classes
@@ -170,7 +260,12 @@ def generate(model, cond, max_new_tokens, emb_masks=None, cfg_scale=1.0, cfg_int
     seq[:, T:T+1] = next_token
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
-    generated_tokens, _ = decode_n_tokens(model, next_token, input_pos, max_new_tokens-1, cfg_scale, cfg_interval, **sampling_kwargs)
-    seq[:, T+1:] = torch.cat(generated_tokens, dim=1)
+
+    if tpn_model is not None:
+        generated_tokens, _ = decode_n_tokens_tpn(model, tpn_model, prior_probs, next_token, input_pos, max_new_tokens-1, cfg_scale, cfg_interval, start_token=200, **sampling_kwargs)
+        seq[:, T+1:] = torch.tensor(generated_tokens, device=device)[:,:-1]
+    else:
+        generated_tokens, _ = decode_n_tokens(model, next_token, input_pos, max_new_tokens-1, cfg_scale, cfg_interval, **sampling_kwargs)
+        seq[:, T+1:] = torch.cat(generated_tokens, dim = 1)
 
     return seq[:, T:]
